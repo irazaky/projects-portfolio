@@ -1,0 +1,243 @@
+# --- Imports ---
+import os
+import cv2
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from PIL import Image
+from skimage.feature import local_binary_pattern
+import kagglehub
+
+# --- Scikit-learn Imports ---
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# --- Model Imports ---
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+
+# --- 1. Load Dataset ---
+print("Downloading dataset...")
+path = kagglehub.dataset_download("nirmalsankalana/crop-pest-and-disease-detection")
+print(f"Path to dataset files: {path}")
+
+# Select only the tomato folders
+tomato_classes = [
+    f for f in os.listdir(path)
+    if f.lower().startswith("tomato") and os.path.isdir(os.path.join(path, f))
+]
+print(f"Found {len(tomato_classes)} tomato classes.")
+
+# --- 2. Build DataFrame ---
+image_paths, labels = [], []
+for c in tomato_classes:
+    class_path = os.path.join(path, c)
+    for img_file in os.listdir(class_path):
+        if img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+            image_paths.append(os.path.join(class_path, img_file))
+            labels.append(c)
+
+df = pd.DataFrame({'image_path': image_paths, 'label': labels})
+print("Dataset built successfully!")
+
+# Count images per tomato class
+tomato_counts = {}
+
+for c in tomato_classes:
+    class_path = os.path.join(path, c)
+    tomato_counts[c] = len([f for f in os.listdir(class_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+
+# Print and visualize
+print("Image count per tomato class:\n")
+for k, v in tomato_counts.items():
+    print(f"{k}: {v}")
+
+plt.figure(figsize=(10,5))
+sns.countplot(x='label', data=df, palette='Set2')
+plt.title('Number of Images per Tomato Disease Class')
+plt.xticks(rotation=45, ha='right')
+plt.xlabel('Tomato Disease Class')
+plt.ylabel('Image Count')
+plt.tight_layout()
+plt.show()
+
+# Showing Preview Images
+plt.figure(figsize=(12, 6))
+for i, label in enumerate(df['label'].unique()[:6]):
+    sample = df[df['label'] == label].sample(1).iloc[0]
+    img = cv2.imread(sample['image_path'])
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    plt.subplot(2, 3, i + 1)
+    plt.imshow(img)
+    plt.title(label)
+    plt.axis("off")
+plt.tight_layout()
+plt.show()
+
+# --- 3. Clean and Balance Dataset ---
+df = df.dropna().drop_duplicates().reset_index(drop=True)
+df['image_path'] = df['image_path'].astype(str)
+df['label'] = df['label'].astype(str)
+
+# Balance the dataset
+target_size = 470
+balanced_df = (
+    df.groupby('label', group_keys=False)
+      .sample(n=target_size, random_state=42, replace=True)
+      .sample(frac=1, random_state=42)
+      .reset_index(drop=True)
+)
+print("\nDataset balanced. Class counts:")
+print(balanced_df['label'].value_counts())
+
+# --- 4. Feature Extraction (LBP + Color) ---
+def extract_features_with_lbp(image_path, bins=(8, 8, 8)):
+    """Extract combined color histogram and LBP texture features."""
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return np.zeros(bins[0]*bins[1]*bins[2] + 256)
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        hist = cv2.calcHist([img_rgb], [0, 1, 2], None, bins, [0, 256, 0, 256, 0, 256])
+        cv2.normalize(hist, hist)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lbp = local_binary_pattern(gray, P=8, R=1, method='uniform')
+        lbp_hist, _ = np.histogram(lbp.ravel(), bins=256, range=(0, 256))
+        lbp_hist = lbp_hist / (lbp_hist.sum() + 1e-7)
+
+        return np.concatenate([hist.flatten(), lbp_hist])
+    except:
+        return np.zeros(bins[0]*bins[1]*bins[2] + 256)
+
+print("\nExtracting features...")
+X = np.array([extract_features_with_lbp(p) for p in tqdm(balanced_df['image_path'])])
+encoder = LabelEncoder()
+y = encoder.fit_transform(balanced_df['label'])
+
+print("\nFeature matrix shape:", X.shape)
+print("Labels shape:", y.shape)
+
+# --- 5. Train-Test Split ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# --- 6. Model Training with GridSearchCV ---
+
+# Define the models to be tuned
+models = {
+    "Random Forest": RandomForestClassifier(random_state=42),
+    "SVM (RBF)": SVC(probability=True, random_state=42),
+    "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42),
+    "LightGBM": LGBMClassifier(random_state=42)
+}
+
+# Define the parameter grids for tuning
+param_grids = {
+    "Random Forest": {
+        'pca__n_components': [128, 256],
+        'classifier__n_estimators': [100, 200],
+        'classifier__max_depth': [10, 20]
+    },
+    "SVM (RBF)": {
+        'pca__n_components': [128, 256],
+        'classifier__C': [1, 10],
+        'classifier__gamma': ['scale']
+    },
+    "XGBoost": {
+        'pca__n_components': [128, 256],
+        'classifier__n_estimators': [100, 200],
+        'classifier__learning_rate': [0.1, 0.05]
+    },
+    "LightGBM": {
+        'pca__n_components': [128, 256],
+        'classifier__n_estimators': [100, 200],
+        'classifier__learning_rate': [0.1, 0.05]
+    }
+}
+
+results = {}
+best_estimators = {}
+
+for name, model in models.items():
+    print(f"\n--- Tuning {name} ---")
+
+    # Create the full pipeline
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('pca', PCA()),
+        ('classifier', model)
+    ])
+
+    # Use GridSearchCV to find the best parameters
+    grid_search = GridSearchCV(
+        pipeline,
+        param_grids[name],
+        cv=3,
+        scoring='accuracy',
+        n_jobs=-1,
+        verbose=1
+    )
+
+    grid_search.fit(X_train, y_train)
+
+    # Save the best model and its score
+    best_estimators[name] = grid_search.best_estimator_
+    results[name] = grid_search.best_score_
+
+    print(f"Best parameters for {name}:")
+    print(grid_search.best_params_)
+    print(f"Best cross-val accuracy: {grid_search.best_score_:.4f}")
+
+# --- 7. FINAL EVALUATION & VISUALIZATION ---
+
+print("\n--- Final Model Evaluation ---")
+
+# Evaluate all tuned models on the *test set*
+test_results = {}
+for name, model in best_estimators.items():
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    test_results[name] = acc
+    print(f"\n{name} Test Set Accuracy: {acc:.4f}")
+    print("Classification Report:")
+    print(classification_report(y_test, y_pred, target_names=encoder.classes_))
+
+best_model_name = max(test_results, key=test_results.get)
+best_model = best_estimators[best_model_name]
+print(f"\nBest Overall Model on Test Set: {best_model_name} ({test_results[best_model_name]:.4f} accuracy)")
+
+# --- Accuracy Bar Plot ---
+plt.figure(figsize=(10, 5))
+sns.barplot(x=list(test_results.keys()), y=list(test_results.values()), palette='viridis')
+plt.title("Tuned Model Accuracy Comparison (Test Set)")
+plt.ylabel("Accuracy")
+plt.ylim(0, 1)
+plt.tight_layout()
+plt.show()
+
+# --- Confusion Matrix of Best Model ---
+print(f"\nGenerating Confusion Matrix for {best_model_name}...")
+y_pred_best = best_model.predict(X_test)
+
+cm = confusion_matrix(y_test, y_pred_best)
+plt.figure(figsize=(12, 10))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=encoder.classes_, yticklabels=encoder.classes_)
+plt.title(f'Confusion Matrix: {best_model_name}')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.tight_layout()
+plt.show()
+
+print("\nEvaluation complete!")
